@@ -1,0 +1,125 @@
+import cv2
+import os
+import numpy as np
+import requests
+import RPi.GPIO as GPIO
+from datetime import datetime
+import time
+import threading
+
+# === Buzzer Setup ===
+BUZZER = 17
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(BUZZER, GPIO.OUT)
+
+# === API Endpoint ===
+ALERT_API = "https://firm-detection-api.onrender.com/alert"
+
+# === Allowed living objects only ===
+ALLOWED_CLASSES = ["person", "dog", "cat", "cow", "sheep", "horse", "bird"]
+
+# === Cooldown settings ===
+cooldown_seconds = 15
+last_detection_time = {}
+
+# === Load Model ===
+net = cv2.dnn.readNetFromCaffe(
+    "MobileNetSSD_deploy.prototxt",
+    "MobileNetSSD_deploy.caffemodel"
+)
+
+CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car",
+           "cat", "chair", "cow", "diningtable", "dog", "horse", "motorbike", "person",
+           "pottedplant", "sheep", "sofa", "train", "tvmonitor"]
+
+# === Setup Camera ===
+cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 480)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+
+os.makedirs("captured", exist_ok=True)
+
+print("✅ Smart Farm Detection Running")
+
+def send_alert(label, image_path):
+    try:
+        with open(image_path, 'rb') as img_file:
+            files = {'image': (os.path.basename(image_path), img_file, 'image/jpeg')}
+            data = {'label': label, 'message': f"{label.capitalize()} detected on the farm"}
+            requests.post(ALERT_API, files=files, data=data)
+            print(f"📤 Sent alert for {label}")
+    except Exception as e:
+        print(f"❌ API error: {e}")
+
+def detect_objects(frame):
+    global last_detection_time
+    h, w = frame.shape[:2]
+
+    try:
+        blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)),
+                                     0.007843, (300, 300), 127.5)
+        net.setInput(blob)
+        detections = net.forward()
+    except:
+        print("❌ DNN failed")
+        return
+
+    for i in range(detections.shape[2]):
+        conf = detections[0, 0, i, 2]
+        if conf > 0.6:
+            idx = int(detections[0, 0, i, 1])
+            label = CLASSES[idx]
+
+            if label in ALLOWED_CLASSES:
+                now = time.time()
+                if now - last_detection_time.get(label, 0) < cooldown_seconds:
+                    continue
+                last_detection_time[label] = now
+
+                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+                (x1, y1, x2, y2) = box.astype("int")
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+
+                # Save cropped image
+                crop = frame[y1:y2, x1:x2]
+                filename = f"captured/{label}{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+                if crop.size > 0:
+                    cv2.imwrite(filename, crop)
+                    threading.Thread(target=send_alert, args=(label, filename)).start()
+                else:
+                    print("⚠ Skipped invalid crop")
+
+                # Buzzer
+                GPIO.output(BUZZER, GPIO.HIGH)
+                time.sleep(0.3)
+                GPIO.output(BUZZER, GPIO.LOW)
+
+                # Draw box on original frame
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+# === Main Loop ===
+try:
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+
+        # Detect every 5th frame (~2 fps)
+        if int(time.time() * 10) % 5 == 0:
+            detect_objects(frame)
+
+        cv2.imshow("Smart Farm Live", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except KeyboardInterrupt:
+    print("🛑 Interrupted")
+
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
+    GPIO.cleanup()
+    print("✅ Shutdown complete")
